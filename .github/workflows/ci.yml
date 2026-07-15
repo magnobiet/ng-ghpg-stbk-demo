@@ -1,0 +1,295 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '24'
+      pnpm_version:
+        description: 'PNPM version'
+        required: false
+        type: string
+        default: '11.13.0'
+
+jobs:
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ inputs.pnpm_version || '11.13.0' }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node_version || '24' }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --config.minimumReleaseAge=0
+
+      - parallel:
+          - name: Typecheck
+            run: |
+              pnpm typecheck 2>&1
+              EXIT_CODE=${PIPESTATUS[0]}
+              STATUS=$([ $EXIT_CODE -eq 0 ] && echo '✅ Passed' || echo '❌ Failed')
+              echo "## Typecheck — $STATUS" >> $GITHUB_STEP_SUMMARY
+              exit $EXIT_CODE
+
+          - name: Unit test
+            run: |
+              pnpm test --watch=false --browsers=ChromeHeadless 2>&1
+              EXIT_CODE=${PIPESTATUS[0]}
+              STATUS=$([ $EXIT_CODE -eq 0 ] && echo '✅ Passed' || echo '❌ Failed')
+              echo "## Unit Tests — $STATUS" >> $GITHUB_STEP_SUMMARY
+              exit $EXIT_CODE
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [quality-gate]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ inputs.pnpm_version || '11.13.0' }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node_version || '24' }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --config.minimumReleaseAge=0
+
+      - name: Build
+        run: |
+          pnpm build 2>&1
+          EXIT_CODE=${PIPESTATUS[0]}
+          STATUS=$([ $EXIT_CODE -eq 0 ] && echo '✅ Passed' || echo '❌ Failed')
+          echo "## Build — $STATUS" >> $GITHUB_STEP_SUMMARY
+          exit $EXIT_CODE
+
+  vulnerabilities:
+    name: Security - Check for Vulnerabilities
+    runs-on: ubuntu-latest
+    environment: github-pages
+    needs: [build]
+
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run Snyk — generate SARIF report
+        id: snyk-sarif
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        continue-on-error: ${{ github.ref != 'refs/heads/main' }}
+        with:
+          args: --all-projects --sarif-file-output=snyk.sarif
+
+      - name: Run Snyk — capture human-readable output
+        id: snyk-log
+        if: always()
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          npx snyk test --all-projects > /tmp/snyk.log 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Parse Snyk output and write to Job Summary
+        if: always()
+        run: |
+          chmod +x .github/scripts/parse-snyk-output.sh
+          EXIT_CODE=${{ steps.snyk-log.outputs.exit_code || (steps.snyk-sarif.outcome == 'success' && '0' || '1') }}
+          .github/scripts/parse-snyk-output.sh /tmp/snyk.log "$EXIT_CODE"
+
+      - name: Upload result to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk.sarif
+
+  supply-chain:
+    name: Security - Supply Chain License Compliance
+    runs-on: ubuntu-latest
+    environment: github-pages
+    needs: [build]
+
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: FOSSA Scan
+        id: fossa
+        uses: fossas/fossa-action@main
+        with:
+          api-key: ${{ secrets.FOSSA_API_KEY }}
+          generate-report: markdown
+
+      - name: Upload FOSSA Report to Summary
+        env:
+          FOSSA_REPORT: ${{ steps.fossa.outputs.report }}
+        run: |
+          echo '## FOSSA Report' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          ENCODED_REPO=$(echo "github.com/$GITHUB_REPOSITORY" | sed 's|/|%2F|g')
+          echo "[![FOSSA Status](https://app.fossa.com/api/projects/custom%2B12836%2F${ENCODED_REPO}.svg?type=shield&issueType=license)](https://app.fossa.com/projects/custom%2B12836%2F${ENCODED_REPO}?ref=badge_shield&issueType=license)" >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '<details>' >> $GITHUB_STEP_SUMMARY
+          echo '<summary>Report</summary>' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          printf '%s\n' "$FOSSA_REPORT" >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '</details>' >> $GITHUB_STEP_SUMMARY
+
+  publish-docker:
+    name: Publish Docker Image
+    runs-on: ubuntu-latest
+    needs: [vulnerabilities, supply-chain]
+
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  scan-docker-image:
+    name: Security - Scan Docker Image
+    runs-on: ubuntu-latest
+    needs: [publish-docker]
+
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ needs.publish-docker.outputs.image-digest }}
+          format: sarif
+          output: trivy-results.sarif
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+        continue-on-error: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Delete unsafe image from GHCR
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ needs.publish-docker.outputs.image-digest }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          PACKAGE_NAME: ${{ github.event.repository.name }}
+        run: |
+          echo "Looking for package version with digest: $IMAGE_DIGEST"
+
+          VERSION_ID=$(gh api \
+            "https://api.github.com/users/${REPO_OWNER}/packages/container/${PACKAGE_NAME}/versions" \
+            --paginate \
+            --jq ".[] | select(.name == \"$IMAGE_DIGEST\") | .id")
+
+          if [ -z "$VERSION_ID" ]; then
+            echo "::warning::Package version not found for digest $IMAGE_DIGEST — skipping deletion."
+            exit 0
+          fi
+
+          echo "Deleting package version ID: $VERSION_ID"
+          gh api --method DELETE \
+            "https://api.github.com/users/${REPO_OWNER}/packages/container/${PACKAGE_NAME}/versions/${VERSION_ID}"
+
+          echo "::notice::Image $IMAGE_DIGEST removed from GHCR due to failed security scan."
+
+      - name: Write Trivy summary
+        if: always()
+        run: |
+          STATUS=$([ '${{ job.status }}' == 'success' ] && echo '✅ Passed' || echo '❌ Failed')
+          echo "## Trivy Image Scan — $STATUS" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Scanned image: \`ghcr.io/${{ github.repository }}@${{ needs.publish-docker.outputs.image-digest }}\`" >> $GITHUB_STEP_SUMMARY
