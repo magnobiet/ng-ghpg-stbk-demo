@@ -1,0 +1,66 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '24'
+      pnpm_version:
+        description: 'PNPM version'
+        required: false
+        type: string
+        default: '11.13.0'
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    environment: github-pages
+
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ inputs.pnpm_version || '11.13.0' }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node_version || '24' }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --config.minimumReleaseAge=0
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit test
+        run: pnpm test --watch=false --browsers=ChromeHeadless
+
+      - name: Build
+        run: pnpm build
+
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        continue-on-error: ${{ github.ref != 'refs/heads/main' }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --all-projects --sarif-file-output=snyk.sarif
+
+      - name: Upload result to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk.sarif

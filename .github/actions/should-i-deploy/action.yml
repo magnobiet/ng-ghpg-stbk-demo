@@ -1,0 +1,27 @@
+name: Should I Deploy?
+description: Determines whether a deployment should proceed or be blocked.
+
+inputs:
+  timezone:
+    description: Time zone used for evaluating the deployment.
+    required: false
+    default: UTC
+  lang:
+    description: Language used for the deployment recommendation.
+    required: false
+    default: en
+  date:
+    description: Specific date to validate the deployment against.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+
+  steps:
+    - name: Should I Deploy?
+      shell: bash
+      env:
+        SHOULDIDEPLOY_API_URL: https://shouldideploy.today/api/cli?tz=${{ inputs.timezone }}${{ inputs.date != '' && format('&date={0}', inputs.date) || '' }}${{ inputs.lang != 'en' && format('&lang={0}', inputs.lang) || '' }}
+        SHOULDIDEPLOY_BADGE_URL: https://shouldideploy.today/api/badge?tz=${{ inputs.timezone }}${{ inputs.date != '' && format('&date={0}', inputs.date) || '' }}${{ inputs.lang != 'en' && format('&lang={0}', inputs.lang) || '' }}&style=for-the-badge
+      run: ${{ github.action_path }}/script.sh
