@@ -38,7 +38,7 @@
     "@compodoc/compodoc": "^2.0.0",
     "@storybook/addon-a11y": "^10.5.4",
     "@storybook/addon-docs": "^10.5.0",
-    "@storybook/angular": "^10.5.0",
+    "@storybook/angular": "^10.5.4",
     "@types/jasmine": "^6.0.0",
     "@types/node": "^26.1.1",
     "jasmine-core": "^6.3.0",
