@@ -27,7 +27,7 @@
     "zone.js": "~0.15.1"
   },
   "devDependencies": {
-    "@angular-devkit/architect": "^0.2003.32",
+    "@angular-devkit/architect": "^0.2201.2",
     "@angular-devkit/build-angular": "^20.3.32",
     "@angular-devkit/core": "^20.3.32",
     "@angular/build": "^20.3.32",
